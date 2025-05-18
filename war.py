@@ -10,8 +10,6 @@ import socket
 import socketserver
 import threading
 import sys
-
-
 """
 Namedtuples work like classes, but are much more lightweight so they end
 up being faster. It would be a good idea to keep objects in each of these
@@ -19,10 +17,8 @@ for each game which contain the game's state, for instance things like the
 socket, the cards given, the cards still available, etc.
 """
 Game = namedtuple("Game", ["p1", "p2"])
-
 # Stores the clients waiting to get connected to other clients
 waiting_clients = []
-
 
 class Command(Enum):
     """
@@ -32,7 +28,6 @@ class Command(Enum):
     GAMESTART = 1
     PLAYCARD = 2
     PLAYRESULT = 3
-
 
 class Result(Enum):
     """
@@ -48,42 +43,165 @@ def readexactly(sock, numbytes):
     before numbytes have been received, be sure to account for that here or in
     the caller.
     """
-    # TODO
-    pass
-
+    data = bytearray()
+    while len(data) < numbytes:
+        packet = sock.recv(numbytes - len(data))
+        if not packet:  # EOF
+            return data
+        data.extend(packet)
+    return data
 
 def kill_game(game):
     """
-    TODO: If either client sends a bad message, immediately nuke the game.
+    If either client sends a bad message, immediately nuke the game.
     """
-    pass
-
+    logging.info("Killing game between clients")
+    try:
+        game.p1.close()
+    except:
+        pass
+    try:
+        game.p2.close()
+    except:
+        pass
 
 def compare_cards(card1, card2):
     """
-    TODO: Given an integer card representation, return -1 for card1 < card2,
+    Given an integer card representation, return -1 for card1 < card2,
     0 for card1 = card2, and 1 for card1 > card2
     """
-    pass
+    rank1 = card1 % 13
+    rank2 = card2 % 13
     
-
+    if rank1 < rank2:
+        return -1
+    elif rank1 > rank2:
+        return 1
+    else:
+        return 0
+    
 def deal_cards():
     """
-    TODO: Randomize a deck of cards (list of ints 0..51), and return two
+    Randomize a deck of cards (list of ints 0..51), and return two
     26 card "hands."
     """
-    pass
+    deck = list(range(52))
+    random.shuffle(deck)
+    return deck[:26], deck[26:]
+
+def handle_client_connection(game):
+    """
+    Handle a game between two clients.
+    """
+    p1_socket, p2_socket = game.p1, game.p2
     
+    try:
+        p1_cards, p2_cards = deal_cards()
+        
+        p1_socket.sendall(bytes([Command.GAMESTART.value]) + bytes(p1_cards))
+        p2_socket.sendall(bytes([Command.GAMESTART.value]) + bytes(p2_cards))
+        
+        p1_played_cards = set()
+        p2_played_cards = set()
+        
+        for _ in range(26):
+            p1_msg = readexactly(p1_socket, 2)
+            if len(p1_msg) < 2 or p1_msg[0] != Command.PLAYCARD.value:
+                logging.error("Invalid message from Player 1")
+                kill_game(game)
+                return
+            
+            p1_card = p1_msg[1]
+            
+            if p1_card not in p1_cards or p1_card in p1_played_cards:
+                logging.error("Player 1 played invalid card")
+                kill_game(game)
+                return
+            
+            p1_played_cards.add(p1_card)
+            
+            p2_msg = readexactly(p2_socket, 2)
+            if len(p2_msg) < 2 or p2_msg[0] != Command.PLAYCARD.value:
+                logging.error("Invalid message from Player 2")
+                kill_game(game)
+                return
+            
+            p2_card = p2_msg[1]
+            
+            if p2_card not in p2_cards or p2_card in p2_played_cards:
+                logging.error("Player 2 played invalid card")
+                kill_game(game)
+                return
+            
+            p2_played_cards.add(p2_card)
+            
+            result = compare_cards(p1_card, p2_card)
+            
+            if result > 0:  
+                p1_socket.sendall(bytes([Command.PLAYRESULT.value, Result.WIN.value]))
+                p2_socket.sendall(bytes([Command.PLAYRESULT.value, Result.LOSE.value]))
+            elif result < 0: 
+                p1_socket.sendall(bytes([Command.PLAYRESULT.value, Result.LOSE.value]))
+                p2_socket.sendall(bytes([Command.PLAYRESULT.value, Result.WIN.value]))
+            else:  
+                p1_socket.sendall(bytes([Command.PLAYRESULT.value, Result.DRAW.value]))
+                p2_socket.sendall(bytes([Command.PLAYRESULT.value, Result.DRAW.value]))
+        
+        p1_socket.close()
+        p2_socket.close()
+        
+    except Exception as e:
+        logging.error(f"Error in game: {e}")
+        kill_game(game)
 
 def serve_game(host, port):
     """
-    TODO: Open a socket for listening for new connections on host:port, and
+    Open a socket for listening for new connections on host:port, and
     perform the war protocol to serve a game of war between each client.
     This function should run forever, continually serving clients.
     """
-    pass
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
-
+    server_socket.bind((host, port))
+    
+    server_socket.listen(128) 
+    
+    logging.info(f"War server started on {host}:{port}")
+    
+    games = []
+    
+    while True:
+        client_socket, client_address = server_socket.accept()
+        logging.info(f"New connection from {client_address}")
+        
+        try:
+            msg = readexactly(client_socket, 2)
+            
+            if len(msg) < 2 or msg[0] != Command.WANTGAME.value:
+                logging.error(f"Client {client_address} sent invalid initial message")
+                client_socket.close()
+                continue
+            
+            if not waiting_clients:
+                waiting_clients.append(client_socket)
+                logging.info(f"Client {client_address} waiting for opponent")
+            else:
+                opponent_socket = waiting_clients.pop(0)
+                
+                game = Game(opponent_socket, client_socket)
+                
+                game_thread = threading.Thread(target=handle_client_connection, args=(game,))
+                game_thread.daemon = True
+                game_thread.start()
+                
+                games.append(game)
+                logging.info("Game started")
+                
+        except Exception as e:
+            logging.error(f"Error handling client: {e}")
+            client_socket.close()
+    
 async def limit_client(host, port, loop, sem):
     """
     Limit the number of clients currently executing.
@@ -122,8 +240,8 @@ async def client(host, port, loop):
     except ConnectionResetError:
         logging.error("ConnectionResetError")
         return 0
-    except asyncio.streams.IncompleteReadError:
-        logging.error("asyncio.streams.IncompleteReadError")
+    except asyncio.IncompleteReadError:  
+        logging.error("IncompleteReadError")
         return 0
     except OSError:
         logging.error("OSError")
@@ -167,9 +285,8 @@ def main(args):
                 completed_clients += await client_result
             return completed_clients
         res = loop.run_until_complete(
-            asyncio.Task(run_all_clients(), loop=loop))
+            run_all_clients())
         logging.info("%d completed clients", res)
-
     loop.close()
 
 if __name__ == "__main__":
